@@ -31,13 +31,12 @@ const http = require('http');
 const fs = require('node:fs');
 const path = require('path');
 const chalk = require('chalk')
-const ascii = fs.readFileSync('./handlers/ascii.txt', 'utf8');
+const fs2 = require('fs').promises;
 const { exec } = require('child_process');
-const { init, createVolumesFolder } = require('./handlers/init.js');
-const { seed } = require('./handlers/seed.js');
 const { start, createNewVolume } = require('./routes/FTP.js')
 const { createDatabaseAndUser } = require('./routes/Database.js');
 const config = require('./config.json');
+const statsLogger = require('./routes/Stats.js');
 
 const docker = new Docker({ socketPath: process.env.dockerSocket });
 
@@ -57,9 +56,31 @@ const log = new CatLoggr();
  * user keys from the configuration. Initializes routes for managing Docker instances, deployments, and
  * power controls. These routes are grouped under the '/instances' path.
  */
-console.log(chalk.gray(ascii) + chalk.white(`version v${config.version}\n`));
-init();
-seed();
+async function init() {
+    try {
+        const ascii = fs.readFileSync('./handlers/ascii.txt', 'utf8');
+        console.log(chalk.gray(ascii) + chalk.white(`version v${config.version}\n`));
+        await docker.ping((err) => {
+            if (err) {
+                log.error(chalk.red('Docker is not running or not installed. Please install Docker and try again.'))
+                process.exit()
+            }
+        })
+        log.init('init done')
+
+        const volumesPath = path.join(__dirname, '../volumes');
+        await fs2.mkdir(volumesPath, { recursive: true });
+
+        log.init('volumes folder created successfully');
+
+        // Node Stats
+        statsLogger.initLogger();
+    } catch (error) {
+        log.error('failed to retrieve image list from remote! the panel might be down. error:', error.message);
+        process.exit();
+    }
+}
+init()
 
 app.use(bodyParser.json());
 app.use(basicAuth({
@@ -67,21 +88,68 @@ app.use(basicAuth({
     challenge: true
 }));
 
-// FTP
-start();
-app.get('/ftp/info/:id', (req, res) => {
-    const filePath = './ftp/user-' + req.params.id + '.json';
-    fs.readFile(filePath, 'utf8', (err, data) => {
-        if (err) {
-            console.error('Error reading file:', err);
-            res.status(500).json({ error: 'Error reading file' });
-            return;
+async function startLoggingStats() {
+    setInterval(async () => {
+        try {
+            const stats = await statsLogger.getSystemStats();
+            statsLogger.saveStats(stats);
+        } catch (error) {
+            console.error('Error logging stats:', error);
         }
-        res.json(JSON.parse(data));
-    });
+    }, 10000);
+}
+
+startLoggingStats();
+
+app.get('/stats', async (req, res) => {
+    try {
+        const totalStats = statsLogger.getSystemStats.total();
+        const containers = await docker.listContainers({ all: true });
+        const onlineContainersCount = containers.filter(container => container.State === 'running').length;
+        const uptimeInSeconds = process.uptime();
+
+        const formatUptime = (uptime) => {
+            const minutes = Math.floor((uptime / 60) % 60);
+            const hours = Math.floor((uptime / 3600) % 24);
+            const days = Math.floor(uptime / 86400);
+            const parts = [];
+
+            if (days > 0) parts.push(`${days}d`);
+            if (hours > 0) parts.push(`${hours}h`);
+            if (minutes > 0) parts.push(`${minutes}m`);
+            if (parts.length === 0) return '0m';
+
+            return parts.join(' ');
+        };
+
+        const responseStats = {
+            totalStats,
+            onlineContainersCount,
+            uptime: formatUptime(uptimeInSeconds)
+        };
+
+        res.json(responseStats);
+    } catch (error) {
+        console.error('Error fetching stats:', error);
+        res.status(500).json({ error: 'Failed to fetch stats' });
+    }
 });
 
-// Databases
+// FTP
+start();
+// FTP Route
+app.get('/ftp/info/:id', async (req, res) => {
+    const filePath = './ftp/user-' + req.params.id + '.json';
+    try {
+        const data = await fs2.readFile(filePath, 'utf8');
+        res.json(JSON.parse(data));
+    } catch (err) {
+        console.error(`Error reading file for user ${req.params.id}:`, err);
+        res.status(500).json({ error: 'Error reading FTP information' });
+    }
+});
+
+// Database Route
 app.post('/database/create/:name', async (req, res) => {
     try {
         const dbName = req.params.name;
@@ -127,7 +195,6 @@ function loadRouters() {
 
 // Call the function to load routers
 loadRouters();
-
 
 /**
  * Initializes a WebSocket server tied to the HTTP server. This WebSocket server handles real-time
@@ -253,10 +320,7 @@ function initializeWebSocketServer(server) {
             ws.on('message', (msg) => {
                 if (isAuthenticated) {
                     const command = JSON.parse(msg).command;
-                    
-                    if (command === "skyportCredits") {
-                        ws.send("privt00, am5z, achul123, thatdevwolfy");
-                    } else if (command) {
+                    if (command) {
                         executeCommand(ws, container, command);
                     }
                 }
@@ -353,8 +417,8 @@ function initializeWebSocketServer(server) {
             try {
                 await actionMap[action]();
             } catch (err) {
-                console.error(`Error performing ${action} action:`, err);
-                ws.send(`\r\n\u001b[33m[skyportd] \x1b[0Action failed: ${err.message}\r\n`);
+                log.error(`Error performing ${action} action:`, err.message);
+                ws.send(`\r\n\u001b[33m[skyportd] \x1b[0mAction failed: ${err.message}\r\n`);
             }
         }
 
@@ -431,13 +495,13 @@ app.get('/', async (req, res) => {
 
         res.json(response); // the point of this? just use the ws - yeah conn to the ws on nodes page and send that json over ws
     } catch (error) {
-        console.error('Error fetching Docker status:', error);
+        log.error('Error fetching Docker status:', error);
         res.status(500).json({ error: 'Docker is not running - skyportd will not function properly.' });
     }
 });
 
 app.use((err, req, res, next) => {
-    console.error(err.stack);
+    log.error(err.stack);
     res.status(500).send('Something has... gone wrong!');
 });
 
@@ -446,9 +510,8 @@ app.use((err, req, res, next) => {
  * Logs a startup message indicating successful listening. This delayed start allows for any necessary
  * initializations to complete before accepting incoming connections.
  */
-const port = config.port;
-setTimeout(function (){
-  server.listen(port, () => {
-    log.info('skyportd is listening on port ' + port);
-  });
-}, 2000);
+async function startServer() {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    server.listen(config.port, () => log.info(`Skyport Daemon is listening on port ${config.port}`));
+}
+startServer();
